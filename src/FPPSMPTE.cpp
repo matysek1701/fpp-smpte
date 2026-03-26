@@ -51,11 +51,17 @@ public:
         if (len > 2048) {
             return;
         }
-        
+
+        // Fix: save original ms before the else-branch modifies it through
+        // successive integer divisions.  The look-ahead section below needs
+        // the original millisecond value, not the hours-residue left over
+        // after decomposing the timestamp into H/M/S/F fields.
+        const uint64_t originalMs = ms;
+
         uint64_t frame = ms;
         frame *= framerate;
         frame /= 1000;
-       
+
         if ((lastFrame < frame) || (frame == 0) || (lastFrame > frame + 3)) {
             if (lastFrame == (frame - 1)) {
                 ltc_encoder_inc_timecode(ltcEncoder);
@@ -83,9 +89,11 @@ public:
             len = ltc_encoder_get_bufferptr(ltcEncoder, &buf, 1);
             SDL_QueueAudio(audioDev, buf, len);
         }
+        // Fix: use originalMs for the look-ahead calculation so that the
+        // frame number is always derived from the correct millisecond value.
         int i = GetChannelOutputRefreshRate();
-        ms += (1000/i);
-        frame = ms;
+        uint64_t nextMs = originalMs + (1000 / i);
+        frame = nextMs;
         frame *= framerate;
         frame /= 1000;
         if ((lastFrame+1) < frame) {
@@ -179,8 +187,18 @@ public:
             }
             
             ltc_encoder_set_buffersize(ltcEncoder, obtained.freq, framerate);
-            ltc_encoder_reinit(ltcEncoder, obtained.freq, framerate,
-                    framerate==25?LTC_TV_625_50:LTC_TV_525_60, 0);
+            // Fix: match the same TV-standard selection used in enableOutput() so
+            // that 24 fps gets LTC_TV_FILM_24 instead of falling through to
+            // LTC_TV_525_60 (NTSC), which produced a corrupt 24 fps bitstream.
+            LTC_TV_STANDARD reinitTvCode;
+            if (framerate == 25) {
+                reinitTvCode = LTC_TV_625_50;
+            } else if (framerate == 24) {
+                reinitTvCode = LTC_TV_FILM_24;
+            } else {
+                reinitTvCode = LTC_TV_525_60;
+            }
+            ltc_encoder_reinit(ltcEncoder, obtained.freq, framerate, reinitTvCode, 0);
             ltc_encoder_set_filter(ltcEncoder, 0);
             //ltc_encoder_set_filter(ltcEncoder, 25.0);
             //ltc_encoder_set_volume(ltcEncoder, -18.0);
@@ -264,10 +282,13 @@ public:
             uint64_t oms = (uint64_t)f;
             msTimeStamp += oms;
 
-            // Fix: the old check `df > 0 && df < 5000` silently dropped any timecode jump
-            // larger than 5 seconds (seeks, restarts, large scrubs) AND prevented the
-            // stop-at-00:00:00:00 (idx=-99) signal from ever being sent after such a jump.
-            // Now we process every frame where TC changed, regardless of jump size.
+            // Fix: save the raw (unmodified) timestamp now.  HOUR and MIN15
+            // processing below modifies msTimeStamp with %= DIV.  Storing
+            // the reduced value in lastMS caused the next frame's full
+            // timestamp to ALWAYS differ from it, so every LTC frame fired
+            // a sync event (sync flood) in those two modes.
+            const uint64_t rawTimeStamp = msTimeStamp;
+
             if (msTimeStamp != p->lastMS && p->inputEventFileWrite >= 0) {
                 //LogDebug(VB_PLUGIN, "SMPTE RX: h:%d m:%d s:%d f:%d -> %lums\n",
                 //         stime.hours, stime.mins, stime.secs, stime.frame, (unsigned long)msTimeStamp);
@@ -302,7 +323,9 @@ public:
                 const uint64_t signal = 1;
                 write(p->inputEventFileWrite, &signal, sizeof(signal));
             }
-            p->lastMS = msTimeStamp;
+            // Fix: track the raw (pre-modulo) timestamp so the comparison on
+            // the next frame uses a value on the same scale as msTimeStamp.
+            p->lastMS = rawTimeStamp;
         }
     }
     bool enableInput() {
@@ -353,23 +376,27 @@ public:
                 timeCodePType = TimeCodeProcessingType::PLAYLIST_POS;
             }            
             if (getFPPmode() == REMOTE_MODE) {
-                if (enableInput()) {
-                    actAsMaster = settings["SMPTEResendMultisync"] == "1";
+                // Fix: create the eventfd/pipe BEFORE enabling the audio input.
+                // enableInput() unpauses the SDL audio device, making the
+                // callback live immediately.  If inputEventFileWrite were still
+                // -1 at that point, any LTC frames decoded during the brief gap
+                // would update lastMS without signalling the main thread, silently
+                // dropping the very first sync event.
 #ifndef PLATFORM_OSX
-                    inputEventFileRead = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-                    inputEventFileWrite = inputEventFileRead;
+                inputEventFileRead = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                inputEventFileWrite = inputEventFileRead;
 #else
+                {
                     int files[2];
                     pipe(files);
                     inputEventFileRead = files[0];
                     inputEventFileWrite = files[1];
-                    // Fix: F_SETFD sets file-descriptor flags (close-on-exec), not file-status
-                    // flags. O_NONBLOCK is a file-status flag and must be set with F_SETFL.
-                    // Without this fix the pipe is blocking, and the drain loop below hangs
-                    // the main FPP thread when the pipe runs dry.
                     fcntl(inputEventFileRead,  F_SETFL, O_NONBLOCK);
                     fcntl(inputEventFileWrite, F_SETFL, O_NONBLOCK);
+                }
 #endif
+                if (enableInput()) {
+                    actAsMaster = settings["SMPTEResendMultisync"] == "1";
                     callbacks[inputEventFileRead] = [this](int i) {
                         // Drain all pending signals. The actual sync data comes from the
                         // mutex-protected triplet (currentPosMS / currentIdx / currentUserBits)
