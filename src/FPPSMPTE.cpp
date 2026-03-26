@@ -19,7 +19,7 @@
 class FPPSMPTEPlugin : public FPPPlugin, public MultiSyncPlugin {
     
 public:
-    FPPSMPTEPlugin() : FPPPlugin("fpp-smpte"), audioDev(0) {
+    FPPSMPTEPlugin() : FPPPlugin("fpp-smpte-test"), audioDev(0) {
         LogInfo(VB_PLUGIN, "Initializing SMPTE Plugin\n");
         setDefaultSettings();
         SDL_Init(SDL_INIT_AUDIO);
