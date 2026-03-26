@@ -1,5 +1,5 @@
 {
-	"repoName": "fpp-smpte",
+	"repoName": "fpp-smpte-test",
 	"name": "SMPTE Test",
 	"author": "Daniel Kulp ++",
 	"description": "Listener/Generator for SMPTE Linear Time Codes TEST",
